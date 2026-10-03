@@ -14,16 +14,17 @@ from roomscan.export.ply import export_raw_scan
 from roomscan.geometry.backproject import collect_points
 from roomscan.geometry.frame import manhattan_yaw, yaw_rotation
 from roomscan.geometry.freespace import carve
-from roomscan.geometry.planes import ceiling_plane, floor_plane
+from roomscan.geometry.planes import ceiling_plane, floor_plane, room_ceilings
 from roomscan.geometry.polygon import build_complex
-from roomscan.geometry.rooms import build_rooms, find_openings, line_profiles, segment_cells
-from roomscan.geometry.walls import detect_walls
+from roomscan.geometry.rooms import build_rooms, find_openings, line_profiles, segment_cells, wall_cells
+from roomscan.geometry.walls import consolidate, detect_walls, split_structural
 from roomscan.io.stray import load_stray
 from roomscan.render.plan import Z90, render_plan
 
 CHUNK_FRAMES = 60  # block-bootstrap unit, ~1.3 s at Stray's frame rate
 WALL_BAND_BOTTOM = 0.3  # above floor: skips skirting boards
 WALL_HIGH_BAND = 1.2  # above floor: wall evidence above typical furniture
+DOOR_HEAD = 1.95  # above floor: wall evidence below door heads (lintels would close doorways)
 CEILING_MARGIN = 0.15
 DEFAULT_TOP = 2.2  # above floor, used when the ceiling was not scanned
 ASSUMED_CEILING = 2.4  # only for the 3-D model when the ceiling was not scanned
@@ -43,7 +44,14 @@ def run_lidar(
 ) -> dict:
     t0 = time.perf_counter()
     cap = load_stray(capture)
-    pts, nrm, fidx = collect_points(cap, frame_stride, pixel_stride)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache = out_dir / f".points_f{frame_stride}_p{pixel_stride}.npz"
+    if cache.is_file():
+        c = np.load(cache)
+        pts, nrm, fidx = c["pts"], c["nrm"], c["fidx"]
+    else:
+        pts, nrm, fidx = collect_points(cap, frame_stride, pixel_stride)
+        np.savez(cache, pts=pts, nrm=nrm, fidx=fidx)
     chunks = fidx // CHUNK_FRAMES
 
     theta = manhattan_yaw(nrm)
@@ -59,7 +67,11 @@ def run_lidar(
         warnings.append("Ceiling not observed; ceiling height not reported. Sweep the phone up to the ceiling.")
     top = ceil.value - CEILING_MARGIN if ceil else floor.value + DEFAULT_TOP
 
-    walls = detect_walls(pts, nrm, chunks, floor.value + WALL_BAND_BOTTOM, top, floor.value + WALL_HIGH_BAND)
+    walls = consolidate(
+        detect_walls(pts, nrm, chunks, floor.value + WALL_BAND_BOTTOM, top,
+                     floor.value + WALL_HIGH_BAND, floor.value + DOOR_HEAD)
+    )
+    walls, objects = split_structural(walls)
 
     rng = np.random.default_rng(0)
     ray_idx = np.arange(len(pts))
@@ -82,16 +94,29 @@ def run_lidar(
     prof = line_profiles(cx)
     lab = segment_cells(cx, prof)
     rooms = build_rooms(cx, lab)
-    openings, adjacency = find_openings(cx, lab, rooms, prof)
+    openings, adjacency = find_openings(cx, lab, rooms, prof, cams[:, [0, 2]])
+    wall_mask = wall_cells(cx, lab)
     if not rooms:
         warnings.append("No closed room could be formed from the detected walls.")
 
-    height = None
+    global_height = None
     if ceil is not None:
-        height = measure(ceil.value - floor.value, float(np.hypot(ceil.sigma, floor.sigma)))
+        global_height = measure(ceil.value - floor.value, float(np.hypot(ceil.sigma, floor.sigma)))
+    per_room = room_ceilings(pts, nrm, chunks, floor.value, cx.xs, cx.zs, lab)
+    heights: dict[str, dict | None] = {}
+    for k, room in enumerate(rooms, start=1):
+        if k in per_room:
+            c = per_room[k]
+            heights[room.id] = {**measure(c.value - floor.value, float(np.hypot(c.sigma, floor.sigma))),
+                                "source": "room"}
+        elif global_height is not None:
+            heights[room.id] = {**global_height, "source": "property"}
+        else:
+            heights[room.id] = None
+    height = global_height
 
     result = {
-        "schema_version": "0.2",
+        "schema_version": "0.3",
         "pipeline_version": __version__,
         "tier": "lidar",
         "calibrated": False,
@@ -107,7 +132,7 @@ def run_lidar(
                 "id": room.id,
                 "polygon_m": [[round(x, 4), round(z, 4)] for x, z in room.polygon],
                 "floor_area_m2": measure(room.area, room.area_sigma),
-                "ceiling_height_m": height,
+                "ceiling_height_m": heights[room.id],
                 "walls": [
                     {
                         "id": w.id,
@@ -131,10 +156,27 @@ def run_lidar(
                 "end_m": [round(v, 4) for v in o.endpoints()[1]],
                 "width_m": round(o.width, 3),
                 "width_method": "coverage gap, 2 cm bins (jamb refinement pending)",
+                "detected_by": o.source,
+                "wall_thickness_m": round(abs(o.other_offset - o.offset), 3) if o.other_offset is not None else None,
             }
             for o in openings
         ],
-        "adjacency": [{"rooms": list(a.rooms), "via": a.via} for a in adjacency],
+        "adjacency": [
+            {"rooms": list(a.rooms), "via": a.via,
+             "wall_thickness_m": round(a.thickness, 3) if a.thickness is not None else None}
+            for a in adjacency
+        ],
+        "objects": [
+            {
+                "id": f"obj{n}",
+                "kind": "furniture_face",
+                "start_m": [round(v, 4) for v in ((f.offset, f.span[0]) if f.axis == "x" else (f.span[0], f.offset))],
+                "end_m": [round(v, 4) for v in ((f.offset, f.span[1]) if f.axis == "x" else (f.span[1], f.offset))],
+                "height_m": round(f.top - floor.value, 3),
+                "rule": "wall visible above this face",
+            }
+            for n, f in enumerate(objects, start=1)
+        ],
         "warnings": warnings,
         "outputs": {"plan_png": "plan.png", "model_glb": "plan3d.glb"},
         "timing_s": None,
@@ -144,9 +186,12 @@ def run_lidar(
     title = f"{cap.root.name} | LiDAR | " + (
         f"ceiling {height['value']:.3f} m" if height else "ceiling not observed"
     ) + " | intervals: 90%, uncalibrated"
-    render_plan(rooms, openings, walls, grid, cams[:, [0, 2]], out_dir / "plan.png", title)
+    render_plan(rooms, openings, objects, cx, lab, wall_mask,
+                {r: (h["value"] if h else None) for r, h in heights.items()}, floor.value,
+                grid, cams[:, [0, 2]], out_dir / "plan.png", title)
     model_height = height["value"] if height else ASSUMED_CEILING
-    write_glb(out_dir / "plan3d.glb", build_model(cx, lab, rooms, openings, model_height))
+    write_glb(out_dir / "plan3d.glb",
+              build_model(cx, lab, rooms, openings, model_height, wall_mask, objects, floor.value))
     result["model_3d"] = {
         "wall_height_m": model_height,
         "wall_height_source": "measured" if height else "assumed",

@@ -6,9 +6,11 @@ import numpy as np
 from roomscan.export.gltf import Primitive
 from roomscan.geometry.polygon import CellComplex
 from roomscan.geometry.rooms import Opening, Room
+from roomscan.geometry.walls import WallPlane
 
 DOOR_HEIGHT = 2.03  # assumed until opening heights are measured
 WALL_RGBA = (0.88, 0.87, 0.84, 1.0)
+OBJECT_RGBA = (0.55, 0.36, 0.20, 0.6)
 PALETTE = [
     (0.55, 0.71, 0.89), (0.95, 0.70, 0.45), (0.60, 0.83, 0.60), (0.85, 0.60, 0.80),
     (0.95, 0.88, 0.50), (0.60, 0.80, 0.85), (0.80, 0.70, 0.60), (0.75, 0.75, 0.95),
@@ -42,7 +44,14 @@ def _wall_quad(mesh: _Mesh, axis: str, offset: float, s0: float, s1: float, y0: 
 
 
 def build_model(
-    cx: CellComplex, lab: np.ndarray, rooms: list[Room], openings: list[Opening], height: float
+    cx: CellComplex,
+    lab: np.ndarray,
+    rooms: list[Room],
+    openings: list[Opening],
+    height: float,
+    wall_mask: np.ndarray | None = None,
+    objects: list[WallPlane] | None = None,
+    floor_y: float = 0.0,
 ) -> list[Primitive]:
     xs, zs = cx.xs, cx.zs
     prims = []
@@ -62,7 +71,7 @@ def build_model(
             lo, hi = w.along
             cuts = sorted(
                 (max(o.start, lo), min(o.end, hi), o.kind) for o in openings
-                if o.axis == axis and abs(o.offset - offset) < 1e-6 and o.start < hi and o.end > lo
+                if o.axis == axis and any(abs(f - offset) < 1e-6 for f in o.offsets) and o.start < hi and o.end > lo
             )
             s = lo
             for c0, c1, kind in cuts:
@@ -73,6 +82,17 @@ def build_model(
                 s = max(s, c1)
             if hi > s:
                 _wall_quad(walls, axis, offset, s, hi, 0.0, height)
+    if wall_mask is not None:
+        for i, j in zip(*np.nonzero(wall_mask)):
+            walls.quad(np.array([[xs[i], height, zs[j]], [xs[i + 1], height, zs[j]],
+                                 [xs[i + 1], height, zs[j + 1]], [xs[i], height, zs[j + 1]]]))
     p, t = walls.arrays()
     prims.append(Primitive("walls", p, t, WALL_RGBA))
+
+    if objects:
+        furniture = _Mesh()
+        for f in objects:
+            _wall_quad(furniture, f.axis, f.offset, f.span[0], f.span[1], 0.0, float(f.top - floor_y))
+        p, t = furniture.arrays()
+        prims.append(Primitive("furniture faces", p, t, OBJECT_RGBA))
     return prims

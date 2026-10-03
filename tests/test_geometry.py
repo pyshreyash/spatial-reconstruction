@@ -3,8 +3,8 @@ import numpy as np
 from roomscan.geometry.frame import manhattan_yaw, yaw_rotation
 from roomscan.geometry.freespace import FreeSpaceGrid
 from roomscan.geometry.polygon import _mincut, _trace_loops, build_complex
-from roomscan.geometry.rooms import build_rooms, find_openings, line_profiles, segment_cells
-from roomscan.geometry.walls import WallPlane
+from roomscan.geometry.rooms import build_rooms, find_openings, line_profiles, segment_cells, wall_cells
+from roomscan.geometry.walls import WallPlane, consolidate, split_structural
 
 
 def test_manhattan_yaw_recovers_rotation():
@@ -77,3 +77,79 @@ def test_partition_with_door_splits_rooms():
     (door,) = openings
     assert door.kind == "door" and abs(door.width - 0.8) <= 0.04
     assert [a.via for a in adjacency] == ["door"]
+
+
+def _two_rooms_thick_wall(gap):
+    walls = [
+        _wall("x", 1, 0.0, 0.0, 3.0), _wall("x", -1, 4.0, 0.0, 3.0),
+        _wall("z", 1, 0.0, 0.0, 4.0), _wall("z", -1, 3.0, 0.0, 4.0),
+        _wall("x", -1, 2.45, 0.0, 3.0, gap=gap), _wall("x", 1, 2.55, 0.0, 3.0, gap=gap),
+    ]
+    grid = _grid(4.0, 3.0)
+    grid.free[25 + int(2.45 / 0.02):25 + int(2.55 / 0.02), :] = 0  # the wall body
+    if gap:
+        lo, hi = gap
+        grid.free[25 + int(2.45 / 0.02):25 + int(2.55 / 0.02), 25 + int(lo / 0.02):25 + int(hi / 0.02)] = 10
+    return walls, grid
+
+
+def test_door_through_thick_wall():
+    walls, grid = _two_rooms_thick_wall((1.0, 1.8))
+    rooms, (openings, adjacency) = _pipeline(walls, grid)
+    assert len(rooms) == 2
+    (door,) = openings
+    assert abs(door.width - 0.8) <= 0.04
+    assert [a.via for a in adjacency] == ["door"]
+
+
+def test_solid_thick_wall_is_a_wall_body_with_thickness():
+    walls, grid = _two_rooms_thick_wall(None)
+    cx = build_complex(walls, grid)
+    prof = line_profiles(cx)
+    lab = segment_cells(cx, prof)
+    rooms = build_rooms(cx, lab)
+    openings, (adj,) = find_openings(cx, lab, rooms, prof)
+    assert len(rooms) == 2 and openings == []
+    assert adj.via == "wall" and abs(adj.thickness - 0.1) < 1e-6
+    assert wall_cells(cx, lab).any()
+
+
+def test_camera_path_reveals_door_hidden_by_narrow_gap():
+    # A 0.45 m coverage gap (e.g. door leaf half open) is too narrow for a wall-gap door;
+    # walking through it proves it is one.
+    walls = [
+        _wall("x", 1, 0.0, 0.0, 3.0), _wall("x", -1, 4.0, 0.0, 3.0),
+        _wall("z", 1, 0.0, 0.0, 4.0), _wall("z", -1, 3.0, 0.0, 4.0),
+        _wall("x", -1, 2.5, 0.0, 3.0, gap=(1.0, 1.45)),
+    ]
+    grid = _grid(4.0, 3.0)
+    cx = build_complex(walls, grid)
+    prof = line_profiles(cx)
+    lab = segment_cells(cx, prof)
+    rooms = build_rooms(cx, lab)
+    assert find_openings(cx, lab, rooms, prof)[0] == []
+    path = np.array([[1.5, 1.2], [3.5, 1.2]])
+    (door,) = find_openings(cx, lab, rooms, prof, path)[0]
+    assert door.source == "camera_path" and 0.4 <= door.width <= 0.5
+
+
+def test_consolidate_merges_near_duplicate_faces():
+    a = _wall("x", 1, 0.00, 0.0, 3.0)
+    b = _wall("x", 1, 0.05, 0.0, 2.0)
+    b.n_points = 10
+    (merged,) = consolidate([a, b])
+    assert merged.offset == 0.0
+    assert len(consolidate([a, _wall("x", -1, 0.05, 0.0, 2.0)])) == 2
+
+
+def test_split_structural_finds_furniture_in_front_of_visible_wall():
+    wall = _wall("z", 1, 0.0, 0.0, 4.0)
+    s = np.arange(0.0, 4.0, 0.01)
+    wall.samples = np.stack([np.repeat(s, 5), np.tile(np.linspace(0.3, 2.4, 5), len(s))], 1)
+    fridge = _wall("z", 1, 0.6, 1.0, 1.7)
+    fridge.top = 1.8
+    shelf = _wall("z", 1, 0.6, 2.5, 3.0)
+    shelf.top = 2.45  # reaches as high as the wall evidence: cannot be told apart, kept as wall
+    walls, objects = split_structural([wall, fridge, shelf])
+    assert objects == [fridge]
+    assert shelf in walls and wall in walls

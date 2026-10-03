@@ -124,6 +124,16 @@ Segmentation (implemented, `geometry/rooms.py`): each wall line gets a **closed 
 
 Inside cells connect only across edges that are < 50 % closed; connected components are rooms (rooms < 1 m² merge into their largest neighbour). Doorway gaps between two different rooms become `door` openings; rooms sharing closed edges or separated by a thin (< 35 cm) outside strip are adjacent via `wall`. Morphological erosion (Bormann 2016) was tried first and rejected: it cannot tell a 1 m hallway from a 1 m opening.
 
+Refinements (from scan2/scan3):
+
+- **Evidence band 1.2–1.95 m** above the floor: above furniture, below door heads. Using evidence up to the ceiling let lintels close every doorway in a 3.1 m-high flat.
+- **Near-duplicate faces** (same facing, < 8 cm apart: skirting, frames, drift) fold into the strongest face.
+- **Furniture vs wall**: a face ≤ 2.5 m long is furniture when the same wall is seen 0.2–1.0 m behind it *and* continuing above the face's top. Ceiling reach alone fails: most real walls were only scanned to 1.5–2.7 m of a 3.1 m ceiling.
+- **Doors through thick walls**: room lookup hops a thin wall strip, so a doorway in a 10–17 cm wall connects the rooms on both sides.
+- **Camera-path doors**: wherever the walking path crosses a wall line between two rooms, the nearest coverage gap (≥ 0.4 m) is a doorway; a person cannot walk through a wall.
+- **Wall bodies and thickness**: thin outside strips between rooms are wall bodies; their width is reported as wall thickness (measured 10.5–17 cm on scan3).
+- **Per-room ceiling height** from downward-facing points above each room; falls back to the property ceiling.
+
 Drift: VIO has 4 unobservable DOF (yaw + xyz), so correct 4 DOF per fragment.
 
 (a) Pose graph with loop closure (Choi, Zhou, Koltun 2015):
