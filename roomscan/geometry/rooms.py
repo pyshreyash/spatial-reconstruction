@@ -110,10 +110,13 @@ def line_profiles(cx: CellComplex) -> dict[tuple[str, int], LineProfile]:
         res = (hi - lo) / n
         edges = lo + np.arange(n + 1) * res
         for idx, line in enumerate(lines):
-            covered = np.histogram(line.along, edges)[0] >= 2
+            evidence = line.trusted if line.trusted is not None else line.along
+            covered = np.histogram(evidence, edges)[0] >= 2
             solid = covered.copy()
             for p in perp:
-                if p.covered(line.offset - CORNER_TOL, line.offset + CORNER_TOL).any():
+                pe = p.trusted if p.trusted is not None else p.along
+                a, b = line.offset - CORNER_TOL, line.offset + CORNER_TOL
+                if (np.histogram(pe, np.linspace(a, b, max(1, int(round((b - a) / COVER_RES))) + 1))[0] >= 2).any():
                     solid[int(np.clip((p.offset - lo) / res, 0, n - 1))] = True
             closed, doors = solid.copy(), []
             if covered.sum() * res >= MIN_PARTITION:

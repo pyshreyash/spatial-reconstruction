@@ -22,6 +22,7 @@ class Line:
     offset: float
     sigma: float
     along: np.ndarray
+    trusted: np.ndarray | None = None  # evidence for room separation (None: `along`)
 
     def covered(self, a: float, b: float, res: float = COVER_RES) -> np.ndarray:
         """Per-bin wall evidence along [a, b]."""
@@ -65,7 +66,10 @@ def build_lines(walls: list[WallPlane], axis: str) -> list[Line]:
     for g in groups:
         inv = np.array([1 / w.sigma**2 for w in g])
         off = float(np.dot(inv, [w.offset for w in g]) / inv.sum())
-        lines.append(Line(axis, off, float(1 / np.sqrt(inv.sum())), np.concatenate([w.along for w in g])))
+        trusted = None
+        if any(w.trusted is not None for w in g):
+            trusted = np.concatenate([w.trusted if w.trusted is not None else w.along for w in g])
+        lines.append(Line(axis, off, float(1 / np.sqrt(inv.sum())), np.concatenate([w.along for w in g]), trusted))
     return lines
 
 

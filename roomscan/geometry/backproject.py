@@ -30,36 +30,52 @@ def frame_points(
 
     u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     P = np.stack([(u - cx) * d / fx, (v - cy) * d / fy, d], axis=-1)
+    return organised_points(P, ok, quat_to_rot(cap.quats[i]), cap.positions[i], pixel_stride, z_range)
 
-    # Normals from central differences on the organised depth grid.
-    du = np.zeros_like(P)
-    dv = np.zeros_like(P)
-    du[:, 1:-1] = P[:, 2:] - P[:, :-2]
-    dv[1:-1] = P[2:] - P[:-2]
+
+def organised_points(
+    P: np.ndarray,
+    ok: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    pixel_stride: int,
+    z_range: tuple[float, float],
+    step: int = 1,
+    P_normals: np.ndarray | None = None,
+    extra: np.ndarray | None = None,
+):
+    """Organised camera-frame point map (H,W,3) -> world points and normals (and `extra` (H,W) per point).
+    Normals from central differences `step` pixels apart, on `P_normals` (e.g. a smoothed map) if given."""
+    d = P[..., 2]
+    Q = P if P_normals is None else P_normals
+    k = step
+    du = np.zeros_like(Q)
+    dv = np.zeros_like(Q)
+    du[:, k:-k] = Q[:, 2 * k:] - Q[:, :-2 * k]
+    dv[k:-k] = Q[2 * k:] - Q[:-2 * k]
     n = np.cross(du, dv)
     norm = np.linalg.norm(n, axis=-1)
     n /= np.maximum(norm, 1e-12)[..., None]
     n[(n * P).sum(-1) > 0] *= -1
 
     nb_ok = ok.copy()
-    nb_ok[:, 1:-1] &= ok[:, 2:] & ok[:, :-2]
-    nb_ok[1:-1] &= ok[2:] & ok[:-2]
-    nb_ok[:, [0, -1]] = False
-    nb_ok[[0, -1], :] = False
+    nb_ok[:, k:-k] &= ok[:, 2 * k:] & ok[:, :-2 * k]
+    nb_ok[k:-k] &= ok[2 * k:] & ok[:-2 * k]
+    nb_ok[:, :k] = nb_ok[:, -k:] = False
+    nb_ok[:k, :] = nb_ok[-k:, :] = False
 
     jump = np.zeros_like(d)
-    jump[:, 1:-1] = np.abs(d[:, 2:] - d[:, :-2])
-    jump[1:-1] = np.maximum(jump[1:-1], np.abs(d[2:] - d[:-2]))
-    smooth = jump < 0.05 * d + 0.01
+    jump[:, k:-k] = np.abs(d[:, 2 * k:] - d[:, :-2 * k])
+    jump[k:-k] = np.maximum(jump[k:-k], np.abs(d[2 * k:] - d[:-2 * k]))
+    smooth = jump < (0.05 * d + 0.01) * k
 
     valid = nb_ok & smooth & (d > z_range[0]) & (d < z_range[1]) & (norm > 0)
     s = slice(None, None, pixel_stride)
     sel = valid[s, s]
     Pc = P[s, s][sel]
     Nc = n[s, s][sel]
-
-    R = quat_to_rot(cap.quats[i])
-    return (Pc @ R.T + cap.positions[i]).astype(np.float32), (Nc @ R.T).astype(np.float32)
+    out = (Pc @ R.T + t).astype(np.float32), (Nc @ R.T).astype(np.float32)
+    return out if extra is None else (*out, extra[s, s][sel])
 
 
 def collect_points(

@@ -29,9 +29,12 @@ CEILING_MARGIN = 0.15
 DEFAULT_TOP = 2.2  # above floor, used when the ceiling was not scanned
 ASSUMED_CEILING = 2.4  # only for the 3-D model when the ceiling was not scanned
 MAX_RAYS = 400_000
+MIN_LABELLED = 1000  # fewer labelled points than this: fall back to all points
 
 
-def measure(value: float, sigma: float) -> dict:
+def measure(value: float, sigma: float, rel: float = 0.0) -> dict:
+    """`rel`: tier-level relative error floor (e.g. depth scale bias), combined in quadrature."""
+    sigma = float(np.hypot(sigma, rel * abs(value)))
     return {
         "value": round(value, 4),
         "sigma": round(sigma, 4),
@@ -52,26 +55,54 @@ def run_lidar(
     else:
         pts, nrm, fidx = collect_points(cap, frame_stride, pixel_stride)
         np.savez(cache, pts=pts, nrm=nrm, fidx=fidx)
+    info = {"path": str(cap.root), "frames": cap.n_frames, "duration_s": round(cap.duration_s, 2)}
+    return reconstruct("lidar", info, pts, nrm, fidx, cap.positions, out_dir, raw_scan, t0)
+
+
+TIER_LABEL = {"lidar": "LiDAR", "video": "Video (ARKit poses, no depth)"}
+
+
+def reconstruct(
+    tier: str, capture_info: dict, pts: np.ndarray, nrm: np.ndarray, fidx: np.ndarray, positions: np.ndarray,
+    out_dir: Path, raw_scan: bool, t0: float, rel_sigma: float = 0.0, extra: dict | None = None,
+    wall_refiner=None, labels: np.ndarray | None = None, min_wall_views: int = 1,
+) -> dict:
+    """Shared geometry backend: fused world points + normals (+ frame index per point) -> plan outputs.
+    `wall_refiner(walls, R, floor_y, ceil_y)` may re-measure wall planes (R: world -> Manhattan frame).
+    `labels` (semantics.py groups per point) restrict floor, ceiling and wall fits to matching points."""
+    out_dir.mkdir(parents=True, exist_ok=True)
     chunks = fidx // CHUNK_FRAMES
 
     theta = manhattan_yaw(nrm)
     R = yaw_rotation(theta)
     pts = (pts @ R.T).astype(np.float32)
     nrm = (nrm @ R.T).astype(np.float32)
-    cams = cap.positions @ R.T
+    cams = positions @ R.T
 
     warnings: list[str] = []
-    floor = floor_plane(pts, nrm, chunks)
-    ceil = ceiling_plane(pts, nrm, chunks, floor.value)
+    everything = np.ones(len(pts), bool)
+    is_floor = is_ceil = is_wall = everything
+    if labels is not None:
+        from roomscan.geometry.semantics import CEILING, FLOOR, FURNITURE
+
+        def labelled(m: np.ndarray) -> np.ndarray:
+            return m if m.sum() >= MIN_LABELLED else everything
+        is_floor, is_ceil = labelled(labels == FLOOR), labelled(labels == CEILING)
+        is_wall = labelled(labels != FURNITURE)  # requiring a wall label lost rooms whose walls were unlabelled
+    floor = floor_plane(pts[is_floor], nrm[is_floor], chunks[is_floor])
+    ceil = ceiling_plane(pts[is_ceil], nrm[is_ceil], chunks[is_ceil], floor.value)
     if ceil is None:
         warnings.append("Ceiling not observed; ceiling height not reported. Sweep the phone up to the ceiling.")
     top = ceil.value - CEILING_MARGIN if ceil else floor.value + DEFAULT_TOP
 
     walls = consolidate(
-        detect_walls(pts, nrm, chunks, floor.value + WALL_BAND_BOTTOM, top,
-                     floor.value + WALL_HIGH_BAND, floor.value + DOOR_HEAD)
+        detect_walls(pts[is_wall], nrm[is_wall], chunks[is_wall], floor.value + WALL_BAND_BOTTOM, top,
+                     floor.value + WALL_HIGH_BAND, floor.value + DOOR_HEAD, min_wall_views, fidx[is_wall])
     )
     walls, objects = split_structural(walls)
+    line_info = None
+    if wall_refiner is not None:
+        walls, line_info = wall_refiner(walls, R, floor.value, ceil.value if ceil else None)
 
     rng = np.random.default_rng(0)
     ray_idx = np.arange(len(pts))
@@ -94,6 +125,10 @@ def run_lidar(
     prof = line_profiles(cx)
     lab = segment_cells(cx, prof)
     rooms = build_rooms(cx, lab)
+    for room in rooms:
+        for w in room.walls:
+            w.sigma = float(np.hypot(w.sigma, rel_sigma * w.length))
+        room.area_sigma = float(np.hypot(room.area_sigma, 2 * rel_sigma * room.area))
     openings, adjacency = find_openings(cx, lab, rooms, prof, cams[:, [0, 2]])
     wall_mask = wall_cells(cx, lab)
     if not rooms:
@@ -101,13 +136,13 @@ def run_lidar(
 
     global_height = None
     if ceil is not None:
-        global_height = measure(ceil.value - floor.value, float(np.hypot(ceil.sigma, floor.sigma)))
-    per_room = room_ceilings(pts, nrm, chunks, floor.value, cx.xs, cx.zs, lab)
+        global_height = measure(ceil.value - floor.value, float(np.hypot(ceil.sigma, floor.sigma)), rel_sigma)
+    per_room = room_ceilings(pts[is_ceil], nrm[is_ceil], chunks[is_ceil], floor.value, cx.xs, cx.zs, lab)
     heights: dict[str, dict | None] = {}
     for k, room in enumerate(rooms, start=1):
         if k in per_room:
             c = per_room[k]
-            heights[room.id] = {**measure(c.value - floor.value, float(np.hypot(c.sigma, floor.sigma))),
+            heights[room.id] = {**measure(c.value - floor.value, float(np.hypot(c.sigma, floor.sigma)), rel_sigma),
                                 "source": "room"}
         elif global_height is not None:
             heights[room.id] = {**global_height, "source": "property"}
@@ -118,14 +153,9 @@ def run_lidar(
     result = {
         "schema_version": "0.3",
         "pipeline_version": __version__,
-        "tier": "lidar",
+        "tier": tier,
         "calibrated": False,
-        "capture": {
-            "path": str(cap.root),
-            "frames": cap.n_frames,
-            "duration_s": round(cap.duration_s, 2),
-            "frames_used": int(len(np.unique(fidx))),
-        },
+        "capture": {**capture_info, "frames_used": int(len(np.unique(fidx)))},
         "frame": {"manhattan_yaw_deg": round(float(np.degrees(theta)), 3), "floor_y": round(floor.value, 4)},
         "rooms": [
             {
@@ -181,9 +211,13 @@ def run_lidar(
         "outputs": {"plan_png": "plan.png", "model_glb": "plan3d.glb"},
         "timing_s": None,
     }
+    if extra:
+        result.update(extra)
+    if line_info is not None:
+        result["wall_refinement"] = line_info
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    title = f"{cap.root.name} | LiDAR | " + (
+    title = f"{Path(capture_info['path']).name} | {TIER_LABEL[tier]} | " + (
         f"ceiling {height['value']:.3f} m" if height else "ceiling not observed"
     ) + " | intervals: 90%, uncalibrated"
     render_plan(rooms, openings, objects, cx, lab, wall_mask,
